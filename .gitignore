@@ -1,0 +1,16 @@
+.env
+*.env
+!*.env.example
+config.ini
+__pycache__/
+*.pyc
+dist/
+temp/
+
+# состояние, логи и прогоны (на сервере)
+run/
+state/
+logs/
+
+.DS_Store
+Thumbs.db

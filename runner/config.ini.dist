@@ -1,0 +1,207 @@
+# Единый файл настройки ai_editor_api: провайдеры, модели по этапам, лимиты.
+# Секретов здесь нет: ключи — в ~/.config/ai-editor-api.env (здесь только ИМЯ переменной).
+# После правки ничего перезапускать не нужно — читается в начале каждого прогона.
+# Проверить, что всё отвечает:  python3 check.py        (список моделей: python3 check.py models)
+#
+# Этапы прогона:
+#   triage    — сортировка входа: несызранское, старое, дубли сайта / наших предложений / друг друга.
+#               Дешёвая модель, один запрос без инструментов.
+#   select    — отбор: что предложить, первоисточник (fetch_url, web_search), балл, блок, фактура.
+#               Агентский цикл с инструментами — нужна модель с хорошим tool calling.
+#   rewrite   — рерайт: 3 заголовка, лид, текст, рубрика, теги, превью.
+#   factcheck — сверка текста с фактурой: ok / fix / stop.
+#   fix       — точечные замены по замечаниям фактчекера.
+#
+# Провайдеры [provider:…] (какой работает — provider в [DEFAULT]; можно и свой на этап):
+#   kind       — openai (обычный OpenAI-совместимый шлюз: Beget, Рег.облако; Bearer-ключ, id модели как
+#                есть, ₽ — cost_rub из ответа) | yandex (Yandex AI Studio: заголовок Api-Key, каталог —
+#                OpenAI-Project из folder_env, модель — gpt://<каталог>/<model>; кэш Claude и
+#                prompt_cache_key не шлются; ₽ — по price, в ответе их нет)
+#   base_url, key_env, timeout; folder_env — переменная с id каталога (yandex)
+#   price.<модель> = вход кэш выход — ₽ за 1 млн токенов; считается, только если шлюз не отдал cost_rub
+#
+# Параметры этапа (не заданы — берутся из [DEFAULT]). Любой можно задать под провайдера:
+# model.yandex = aliceai-llm важнее model = … при provider = yandex — так переключение
+# всех этапов на другой шлюз — одна строка provider в [DEFAULT].
+#   provider   — имя секции [provider:…]
+#   key_env    — своя переменная с ключом для этапа (у Beget на ключ — свой месячный лимит и белый
+#                список моделей); пусто — ключ провайдера
+#   model      — id модели, как его отдаёт GET /v1/models (python3 check.py models)
+#   max_tokens — потолок ответа. У Beget обязателен: без него шлюз оценивает стоимость по всему
+#                окну и может отклонить запрос
+#   json       — schema (response_format json_schema, strict) | object (json_object + схема в
+#                промпте) | prompt (только схема в промпте). minimax-m3 — object, claude-opus-5 — schema
+#   cache      — off | 5m | 1h: cache_control на системном промпте. Только для claude-*,
+#                остальные модели шлюза кэшируют сами (промпт от ~5 тыс. токенов).
+#                Beget, Sonnet 5.5 (30.10.2026): вход 234 ₽, чтение кэша 12 ₽ (5%), запись 293 ₽ (1,25×)
+#                за 1 млн — и для 5m, и для 1h (поддержка: так и задумано); поэтому у Claude везде 1h
+#   cache_key  — prompt_cache_key в теле запроса: auto — «ai-editor-api-<этап>», своя строка — как есть,
+#                пусто — не слать. Поддержка Beget (30.10.2026): провайдер раскидывает запросы по
+#                серверам с отдельным кэшем, постоянный ключ на одинаковый префикс повышает попадания;
+#                закрепить сервер иначе нельзя. Модель не примет (HTTP 400) — код сам отключит до конца прогона
+#   fallback   — запасная модель того же провайдера: основная не ответила (HTTP-ошибка после повторов,
+#                обрыв, 401/404) — этап переходит на неё до конца прогона. Пусто — без запасной
+#   extra      — JSON, добавляется в тело запроса как есть: {"reasoning_effort": "low"} и т.п.
+#                temperature/top_p Claude и GPT-5.6/6 через Beget НЕ принимают — не добавлять
+
+[DEFAULT]
+provider = plusvibe
+json = schema
+cache = off
+cache_key = auto
+extra = {}
+# deepseek-v4.1-flash на Яндексе по умолчанию долго «думает» скрыто (reasoning_tokens входят в выход и
+# в max_tokens): 06.11.2026 отбор — 44 тыс. выхода за 12 шагов, итог обрезан на 12000 одними рассуждениями.
+# low — примерно вдвое меньше, none — без рассуждений (у Яндекса работает; minimal — HTTP 400)
+extra.yandex = {"reasoning_effort": "low"}
+max_tokens = 4000
+
+[provider:beget]
+base_url = https://api-llm.beget.com/v1
+key_env = BEGET_API_KEY
+# секунд на один запрос; ретраи — только 429/5xx/обрыв до ответа
+timeout = 240
+
+[provider:regru]
+# ИИ-шлюз Рег.облака (LiteLLM). id моделей свои: claude-5.5-sonnet и т.п. 06.11.2026 — /models
+# отвечало 401 на модели (сбой у них), с вечера 06.11.2026 работает
+base_url = https://ai.reg.cloud/v1
+key_env = REGRU_API_KEY
+timeout = 240
+# ₽ за 1 млн токенов: вход кэш выход (кабинет Рег.облака, 06.11.2026). Шлюз не отдаёт cost_rub и
+# (06.11.2026) не кэширует: cached_tokens всегда 0 у Claude (cache_control любой), DeepSeek, GPT —
+# поэтому «кэш» = вход
+price.deepseek-v4.1-flash = 60 60 105
+price.deepseek-v4-flash = 48 48 156
+price.deepseek-v4-pro = 240 240 732
+price.claude-5.5-sonnet = 384 384 1920
+price.claude-5-sonnet = 369 369 1845
+price.claude-4.5-haiku = 162 162 810
+price.claude-opus-5.5 = 1080 1080 5400
+price.gemini-3.8-flash = 216 216 1080
+price.gpt-6-luna = 36 36 180
+price.gpt-5.5 = 780 780 4680
+price.glm-5.3-flash = 21.6 21.6 72
+price.qwen-3.8-flash-next = 30 30 90
+price.mimo-v2.5 = 25.2 25.2 51.6
+price.minimax-m3 = 90 90 360
+price.kimi-k2.6 = 160.68 160.68 708.72
+price.qwen3.6-plus = 73.32 73.32 439.2
+price.mimo-v2.5-pro = 72 72 156
+price.gemma-4-26b-a4b-it = 11.4 11.4 62.4
+
+[provider:plusvibe]
+# PlusVibeAPI (с 07.11.2026). Кэш — сам у
+# GPT/DeepSeek и др.; у Claude — по cache_control (или шлюз ставит точку сам). ₽ за ответ — заголовок
+# x-pv-cost-rub (оценка шлюза; факт — GET /v1/generations); price.* ниже — запас, если заголовка нет.
+# json_schema strict — только GPT-5.x и совместимые; DeepSeek — json = object
+base_url = https://plusvibeapi.ru/v1
+key_env = PLUSVIBE_API_KEY
+timeout = 240
+# deepseek-v4-flash:free — подарок новому пользователю, бесплатно (07.11.2026): cost_rub не отдаёт, price
+# не задать (configparser режет ключ по «:») — без price считается 0 ₽. Тянет json_object, tools, schema
+# ₽ за 1 млн токенов: вход кэш выход (каталог plusvibeapi.ru/models на 06.11.2026; кэш = вход × множитель)
+price.deepseek-v4.1-flash = 1.91 0.191 7.63
+price.claude-sonnet-5.5 = 59 2.95 294
+price.claude-haiku-5.5 = 3 0.3 13
+price.gpt-6-luna = 3 0.9 19.07
+price.gpt-6.1-terra = 7.12 0.356 35.6
+price.gemini-3.8-flash = 4.72 0.472 23.58
+price.mimo-v2.5 = 3.64 0.364 7.27
+price.glm-5.2 = 2.96 0.296 9.3
+price.qwen3.8-flash = 2.11 0.211 6.2
+
+[provider:yandex]
+# Yandex AI Studio. Ключ — API-ключ сервисного аккаунта с ролью ai.languageModels.user
+# (область yc.ai.foundationModels.execute); ключ поиска (YANDEX_SEARCH_API_KEY) сюда не подходит
+kind = yandex
+base_url = https://ai.api.cloud.yandex.net/v1
+key_env = YANDEX_AI_API_KEY
+folder_env = YANDEX_FOLDER_ID
+timeout = 240
+# ₽ за 1 млн токенов (тарифы AI Studio, синхронный режим, с НДС — на 06.11.2026)
+price.aliceai-llm = 500 500 1200
+price.aliceai-llm-flash = 100 25 200
+price.yandexgpt-5.1 = 800 800 800
+price.deepseek-v4.1-flash = 300 75 500
+price.qwen3.6-35b-a3b = 200 50 300
+
+[stage:triage]
+model = deepseek-v4-flash
+model.yandex = deepseek-v4.1-flash
+# 12.11.2026: бесплатный :free выдавал мусор (JSON не по схеме, обрыв на 16000) — 7 из 30 сортировок, 3 фактчека
+model.plusvibe = deepseek-v4.1-flash
+json.plusvibe = object
+max_tokens = 8000
+# PlusVibe 07.11.2026: без reasoning_effort DeepSeek истратил все 8000 на рассуждения, итога нет
+max_tokens.plusvibe = 16000
+extra.plusvibe = {"reasoning_effort": "low"}
+
+# Яндекс: aliceai-llm НЕ брать — фильтр контента отказывает на обычных городских новостях
+# (06.11.2026, отбор: «Я не могу обсуждать эту тему», finish_reason content_filter); yandexgpt-5.1 —
+# окно 32k, отбору мало (на 3-м шаге уже 27k). deepseek-v4.1-flash и qwen3.6-35b-a3b — отвечают.
+[stage:select]
+model = claude-5.5-sonnet
+model.yandex = deepseek-v4.1-flash
+model.plusvibe = claude-sonnet-5.5
+max_tokens = 12000
+max_tokens.yandex = 20000
+cache = 1h
+# yes — cache_control ещё и на последнем сообщении (растущий диалог читается из кэша); шлюз не примет — код
+# сам отключит до конца прогона
+cache_tail = yes
+# шагов агентского цикла (запросов к модели), обращений к сети и поисков за прогон
+max_steps = 24
+max_fetches = 10
+max_searches = 5
+# символов страницы, которые видит модель за одно обращение (полный текст хранится и уходит рерайту)
+fetch_chars = 6000
+
+[stage:rewrite]
+model = claude-5.5-sonnet
+model.yandex = deepseek-v4.1-flash
+model.plusvibe = claude-sonnet-5.5
+# 4000 мало: 30.10.2026 20:05 обе новости обрезаны (15,75 ₽ впустую); платится только написанное
+max_tokens = 10000
+cache = 1h
+
+[stage:factcheck]
+model = gemini-3.8-flash
+model.yandex = deepseek-v4.1-flash
+# PlusVibe: бесплатный DeepSeek; schema он держит, но с ней рассуждает ~30 с — object быстрее
+# 12.11.2026: бесплатный :free выдавал мусор (JSON не по схеме, обрыв на 16000) — 7 из 30 сортировок, 3 фактчека
+model.plusvibe = deepseek-v4.1-flash
+json.plusvibe = object
+extra.plusvibe = {"reasoning_effort": "low"}
+max_tokens.plusvibe = 16000
+max_tokens = 3000
+max_tokens.yandex = 6000
+# DeepSeek через Рег.облако рассуждает дольше и reasoning_effort не слушает: 6000 обрезало 3 из 8 (06.11.2026)
+max_tokens.regru = 16000
+
+[stage:fix]
+model = claude-5.5-sonnet
+model.yandex = deepseek-v4.1-flash
+model.plusvibe = claude-sonnet-5.5
+max_tokens = 3000
+cache = 1h
+
+[search]
+# Yandex Search API v2 (Yandex Cloud): ключ сервисного аккаунта с ролью search-api.webSearch.user
+engine = yandex
+key_env = YANDEX_SEARCH_API_KEY
+folder_env = YANDEX_FOLDER_ID
+# регион поиска (225 — Россия); пусто — не задавать
+region = 225
+results = 8
+
+[run]
+# параллельных новостей на этапах рерайт/фактчек
+stage_workers = 3
+# проверок фактчекера на новость (между ними — точечная правка)
+rounds = 3
+# куда писать страницу (index.html, архив — archive/); nginx отдаёт эту папку
+web_dir = /var/www/html/ai-editor-api
+# лента сборщика: URL или путь к файлу (на том же сервере надёжнее файл);
+# пусто — берётся AI_EDITOR_FEED_URL из ~/.config/ai-editor-api.env
+feed =
